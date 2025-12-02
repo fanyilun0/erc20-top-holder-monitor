@@ -94,15 +94,16 @@ def with_retry(max_retries=None, base_delay=None, exceptions=(Exception,)):
 # ================= Token 数据结构 =================
 class TokenInfo:
     """单个 Token 的监控数据"""
-    def __init__(self, address: str, top_n: int, threshold_usd: float):
+    def __init__(self, address: str, top_n: int, threshold_usd: float, chain: str = "ethereum"):
         self.address = address
         self.top_n = top_n
         self.threshold_usd = threshold_usd
+        self.chain = chain  # 所属链名称
         self.symbol = "UNKNOWN"
         self.decimals = 18
         self.price = 0.0
         self.whitelist: Set[str] = set()
-        self.whale_details: Dict[str, dict] = {}
+        self.whale_details: Dict[str, dict] = {}  # {address: {"rank": X, "balance": Y, "label": "..."}}
         self.last_whale_update = 0
         self.last_price_update = 0
         self.chainbase_degraded = False
@@ -111,10 +112,11 @@ class TokenInfo:
 # ================= 核心监控类 =================
 class MultiTokenWhaleMonitor:
     """
-    多 Token ERC20 大户监控器
-    - 支持同时监控多个 ERC20 Token
+    多 Token ERC20 大户监控器 (多链版本)
+    - 支持同时监控多条链上的多个 ERC20 Token
     - 批量获取日志，优化解析效率
     - 定期从 Chainbase 获取 Top Holders 名单
+    - 支持获取地址标签 (Address Label)
     - 实时监听链上 Transfer 事件
     - 触发阈值后推送 Telegram 通知
     """
@@ -123,18 +125,26 @@ class MultiTokenWhaleMonitor:
     TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     
     def __init__(self):
-        self.w3 = Web3(Web3.HTTPProvider(
-            Config.RPC_URL, 
-            request_kwargs={'timeout': Config.RPC_TIMEOUT}
-        ))
+        # 多链 Web3 实例: {chain_name: Web3}
+        self.chain_providers: Dict[str, Web3] = {}
+        
+        # 每条链的最新区块号: {chain_name: block_number}
+        self.chain_latest_blocks: Dict[str, int] = {}
         
         # 多 Token 数据结构
         self.tokens: Dict[str, TokenInfo] = {}  # {checksum_address: TokenInfo}
         self.address_to_checksum: Dict[str, str] = {}  # {lower_address: checksum_address}
         
+        # 按链分组的 Token 地址: {chain_name: [token_addresses]}
+        self.tokens_by_chain: Dict[str, List[str]] = {}
+        
         # 全局大户地址索引 (用于快速匹配)
         # {whale_address: {token_address: rank}}
         self.global_whale_index: Dict[str, Dict[str, int]] = {}
+        
+        # 地址标签缓存: {address: {"label": "...", "updated_at": timestamp}}
+        self.address_labels: Dict[str, dict] = {}
+        self._label_lock = threading.Lock()
         
         # 已处理交易缓存 (防重复)
         self.processed_txs = LRUCache(Config.TX_CACHE_SIZE)
@@ -151,28 +161,73 @@ class MultiTokenWhaleMonitor:
             "errors": 0
         }
         
-        # 验证 RPC 连接
-        self._verify_connection()
+        # 初始化所有链的 RPC 连接
+        self._init_chain_providers()
         
         # 初始化所有 Token
         self._init_tokens()
     
-    def _verify_connection(self):
-        """验证 RPC 连接"""
-        try:
-            if self.w3.is_connected():
-                chain_id = self.w3.eth.chain_id
-                block_num = self.w3.eth.block_number
-                logger.info(f"✅ RPC 连接成功 | Chain ID: {chain_id} | 当前区块: {block_num}")
-            else:
-                raise ConnectionError("RPC 连接失败")
-        except Exception as e:
-            logger.error(f"❌ RPC 连接失败: {e}")
-            logger.error("请检查 .env 中的 RPC_URL 配置")
+    def _init_chain_providers(self):
+        """初始化所有需要的链的 RPC 连接"""
+        # 获取所有配置的 Token，按链分组
+        tokens_by_chain = Config.get_tokens_by_chain()
+        
+        if not tokens_by_chain:
+            logger.error("❌ 未配置任何监控 Token")
             raise SystemExit(1)
+        
+        logger.info(f"🔗 正在初始化 {len(tokens_by_chain)} 条链的 RPC 连接...")
+        
+        for chain_name in tokens_by_chain.keys():
+            try:
+                chain_config = Config.get_chain_config(chain_name)
+                rpc_url = chain_config["rpc_url"]
+                
+                w3 = Web3(Web3.HTTPProvider(
+                    rpc_url, 
+                    request_kwargs={'timeout': Config.RPC_TIMEOUT}
+                ))
+                
+                if w3.is_connected():
+                    chain_id = w3.eth.chain_id
+                    block_num = w3.eth.block_number
+                    
+                    # 验证 chain_id 是否匹配
+                    expected_chain_id = chain_config["chain_id"]
+                    if chain_id != expected_chain_id:
+                        logger.warning(
+                            f"⚠️ {chain_name} Chain ID 不匹配: "
+                            f"期望 {expected_chain_id}, 实际 {chain_id}"
+                        )
+                    
+                    self.chain_providers[chain_name] = w3
+                    self.chain_latest_blocks[chain_name] = block_num
+                    self.tokens_by_chain[chain_name] = []
+                    
+                    logger.info(
+                        f"  ✅ {chain_config['name']} | Chain ID: {chain_id} | "
+                        f"当前区块: {block_num}"
+                    )
+                else:
+                    raise ConnectionError(f"{chain_name} RPC 连接失败")
+                    
+            except Exception as e:
+                logger.error(f"❌ {chain_name} RPC 连接失败: {e}")
+                logger.error(f"   请检查 .env 中的 {chain_name.upper()}_RPC_URL 配置")
+                self.stats["errors"] += 1
+        
+        if not self.chain_providers:
+            logger.error("❌ 没有成功连接任何链")
+            raise SystemExit(1)
+        
+        # 兼容性: 保留 self.w3 指向第一条链 (通常是 ethereum)
+        first_chain = list(self.chain_providers.keys())[0]
+        self.w3 = self.chain_providers[first_chain]
+        
+        logger.info(f"✅ 成功连接 {len(self.chain_providers)} 条链")
     
     def _init_tokens(self):
-        """初始化所有监控的 Token"""
+        """初始化所有监控的 Token (支持多链)"""
         target_tokens = Config.get_target_tokens()
         
         if not target_tokens:
@@ -183,21 +238,33 @@ class MultiTokenWhaleMonitor:
         
         for address, config in target_tokens.items():
             try:
-                checksum_addr = self.w3.to_checksum_address(address)
+                chain = config.get("chain", "ethereum")
+                
+                # 检查链是否已初始化
+                if chain not in self.chain_providers:
+                    logger.warning(f"  ⚠️ 跳过 {address[:10]}...: 链 {chain} 未初始化")
+                    continue
+                
+                w3 = self.chain_providers[chain]
+                chain_config = Config.get_chain_config(chain)
+                
+                checksum_addr = w3.to_checksum_address(address)
                 token_info = TokenInfo(
                     address=checksum_addr,
                     top_n=config["top_n"],
-                    threshold_usd=config["threshold_usd"]
+                    threshold_usd=config["threshold_usd"],
+                    chain=chain
                 )
                 
                 # 获取 Token 元数据
-                self._init_token_metadata(token_info)
+                self._init_token_metadata(token_info, w3)
                 
                 self.tokens[checksum_addr] = token_info
                 self.address_to_checksum[address.lower()] = checksum_addr
+                self.tokens_by_chain[chain].append(checksum_addr)
                 
                 logger.info(
-                    f"  🎯 {token_info.symbol} ({checksum_addr[:10]}...) | "
+                    f"  🎯 [{chain_config['name']}] {token_info.symbol} ({checksum_addr[:10]}...) | "
                     f"Top {token_info.top_n} | 阈值 ${token_info.threshold_usd:,.0f}"
                 )
             except Exception as e:
@@ -208,16 +275,19 @@ class MultiTokenWhaleMonitor:
             logger.error("❌ 没有成功初始化任何 Token")
             raise SystemExit(1)
         
-        logger.info(f"✅ 成功初始化 {len(self.tokens)} 个 Token")
+        logger.info(f"✅ 成功初始化 {len(self.tokens)} 个 Token (跨 {len(self.tokens_by_chain)} 条链)")
     
     @with_retry(max_retries=3, exceptions=(Exception,))
-    def _init_token_metadata(self, token_info: TokenInfo):
+    def _init_token_metadata(self, token_info: TokenInfo, w3: Web3 = None):
         """获取 Token 的 Symbol 和 Decimals"""
+        if w3 is None:
+            w3 = self.chain_providers.get(token_info.chain, self.w3)
+        
         abi = [
             {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
             {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"}
         ]
-        contract = self.w3.eth.contract(address=token_info.address, abi=abi)
+        contract = w3.eth.contract(address=token_info.address, abi=abi)
         token_info.symbol = contract.functions.symbol().call()
         token_info.decimals = contract.functions.decimals().call()
 
@@ -278,15 +348,20 @@ class MultiTokenWhaleMonitor:
     
     def _fetch_from_chainbase(self, token_info: TokenInfo) -> bool:
         """从 Chainbase 获取数据"""
-        logger.info(f"🔄 [{token_info.symbol}] 正在从 Chainbase 更新 Top Holders...")
+        chain_config = Config.get_chain_config(token_info.chain)
+        chain_id = chain_config["chain_id"]
+        
+        logger.info(f"🔄 [{token_info.symbol}] 正在从 Chainbase 更新 Top Holders... (chain_id: {chain_id})")
         
         url = f"https://api.chainbase.online/v1/token/top-holders"
         headers = {"x-api-key": Config.CHAINBASE_KEY}
+        # Chainbase API limit 最大值为 100
+        limit = min(token_info.top_n + 10, 100)
         params = {
-            "chain_id": 1,  # Ethereum Mainnet
+            "chain_id": chain_id,  # 支持多链
             "contract_address": token_info.address.lower(),
             "page": 1,
-            "limit": token_info.top_n + 10
+            "limit": limit
         }
         
         try:
@@ -299,7 +374,12 @@ class MultiTokenWhaleMonitor:
                 return False
             
             if resp.status_code != 200:
-                logger.warning(f"[{token_info.symbol}] Chainbase API 错误: {resp.status_code}")
+                # 记录详细错误信息以便调试
+                try:
+                    error_detail = resp.json()
+                    logger.warning(f"[{token_info.symbol}] Chainbase API 错误: {resp.status_code} | {error_detail}")
+                except:
+                    logger.warning(f"[{token_info.symbol}] Chainbase API 错误: {resp.status_code} | {resp.text[:200]}")
                 return False
             
             result = resp.json()
@@ -309,21 +389,33 @@ class MultiTokenWhaleMonitor:
                 logger.warning(f"[{token_info.symbol}] Chainbase 返回空数据")
                 return False
             
+            w3 = self.chain_providers.get(token_info.chain, self.w3)
             new_list = []
+            addresses_to_label = []
             rank = 1
+            
             for row in data:
-                addr = self.w3.to_checksum_address(row.get('wallet_address', row.get('address', '')))
+                addr = w3.to_checksum_address(row.get('wallet_address', row.get('address', '')))
                 if addr in Config.IGNORE_LIST:
                     continue
                 if rank > token_info.top_n:
                     break
                 balance = float(row.get('original_amount', row.get('amount', 0)))
                 new_list.append((addr, rank, balance))
+                addresses_to_label.append(addr)
                 rank += 1
             
             if new_list:
                 self._update_token_whitelist(token_info, new_list, source="chainbase")
                 logger.info(f"✅ [{token_info.symbol}] Chainbase 更新完成 | 监控 {len(token_info.whitelist)} 地址")
+                
+                # 异步获取地址标签
+                threading.Thread(
+                    target=self._batch_fetch_address_labels,
+                    args=(addresses_to_label, chain_id),
+                    daemon=True
+                ).start()
+                
                 return True
             
             return False
@@ -337,8 +429,105 @@ class MultiTokenWhaleMonitor:
             self.stats["errors"] += 1
             return False
     
+    def _batch_fetch_address_labels(self, addresses: List[str], chain_id: int):
+        """
+        批量获取地址标签 (后台执行)
+        使用 Chainbase 的 account identity API
+        """
+        if not Config.CHAINBASE_KEY or not addresses:
+            return
+        
+        fetched_count = 0
+        for addr in addresses:
+            # 跳过已缓存的标签 (24小时内)
+            with self._label_lock:
+                if addr in self.address_labels:
+                    cache_age = time.time() - self.address_labels[addr].get("updated_at", 0)
+                    if cache_age < 86400:  # 24小时缓存
+                        continue
+            
+            label = self._fetch_address_label(addr, chain_id)
+            if label:
+                with self._label_lock:
+                    self.address_labels[addr] = {
+                        "label": label,
+                        "updated_at": time.time()
+                    }
+                fetched_count += 1
+            
+            # 避免 API 限流
+            time.sleep(0.1)
+        
+        if fetched_count > 0:
+            logger.info(f"🏷️ 获取了 {fetched_count} 个地址标签")
+    
+    def _fetch_address_label(self, address: str, chain_id: int) -> Optional[str]:
+        """
+        获取单个地址的标签
+        
+        优先级:
+        1. Chainbase account identity API (ENS, 标签等)
+        2. 返回 None (无标签)
+        """
+        if not Config.CHAINBASE_KEY:
+            return None
+        
+        # 尝试 Chainbase account identity API
+        url = "https://api.chainbase.online/v1/account/identity"
+        headers = {"x-api-key": Config.CHAINBASE_KEY}
+        params = {
+            "chain_id": chain_id,
+            "address": address.lower()
+        }
+        
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=Config.HTTP_TIMEOUT)
+            
+            if resp.status_code == 200:
+                result = resp.json()
+                data = result.get('data', {})
+                
+                # 优先返回 ENS 名称
+                ens_name = data.get('ens_name') or data.get('ens')
+                if ens_name:
+                    return ens_name
+                
+                # 其次返回其他标签
+                labels = data.get('labels', [])
+                if labels and isinstance(labels, list):
+                    return labels[0] if labels else None
+                
+                # 尝试获取 name 字段
+                name = data.get('name')
+                if name:
+                    return name
+                
+        except Exception as e:
+            logger.debug(f"获取地址标签失败 {address[:10]}...: {e}")
+        
+        return None
+    
+    def get_address_label(self, address: str) -> Optional[str]:
+        """
+        获取地址标签 (从缓存)
+        
+        Returns:
+            str: 地址标签，如 "vitalik.eth" 或 "Binance Hot Wallet"
+            None: 无标签
+        """
+        with self._label_lock:
+            cached = self.address_labels.get(address)
+            if cached:
+                return cached.get("label")
+        return None
+    
     def _fetch_from_ethplorer(self, token_info: TokenInfo) -> bool:
-        """从 Ethplorer 获取数据"""
+        """从 Ethplorer 获取数据 (仅支持 Ethereum 链)"""
+        # Ethplorer 只支持以太坊链
+        if token_info.chain != "ethereum":
+            logger.debug(f"[{token_info.symbol}] Ethplorer 不支持 {token_info.chain} 链，跳过")
+            return False
+        
         logger.info(f"🔄 [{token_info.symbol}] 正在从 Ethplorer 更新 Top Holders...")
         
         url = f"https://api.ethplorer.io/getTopTokenHolders/{token_info.address}"
@@ -483,14 +672,19 @@ class MultiTokenWhaleMonitor:
         else:
             return f"{seconds/86400:.1f}天"
     
-    # ----------------- 模块 B: 价格获取 (DeFiLlama) -----------------
+    # ----------------- 模块 B: 价格获取 (DeFiLlama) - 多链版 -----------------
     def update_all_prices(self):
-        """批量更新所有 Token 价格 (一次 API 调用)"""
+        """批量更新所有 Token 价格 (支持多链)"""
         if not self.tokens:
             return False
         
-        # 构建批量查询 URL
-        token_keys = [f"ethereum:{addr}" for addr in self.tokens.keys()]
+        # 构建批量查询 URL (格式: chain:address)
+        token_keys = []
+        for token_addr, token_info in self.tokens.items():
+            chain_config = Config.get_chain_config(token_info.chain)
+            prefix = chain_config.get("defi_llama_prefix", token_info.chain)
+            token_keys.append(f"{prefix}:{token_addr}")
+        
         url = f"https://coins.llama.fi/prices/current/{','.join(token_keys)}"
         
         try:
@@ -501,7 +695,10 @@ class MultiTokenWhaleMonitor:
             
             updated_count = 0
             for token_addr, token_info in self.tokens.items():
-                key = f"ethereum:{token_addr}"
+                chain_config = Config.get_chain_config(token_info.chain)
+                prefix = chain_config.get("defi_llama_prefix", token_info.chain)
+                key = f"{prefix}:{token_addr}"
+                
                 if key in coins:
                     new_price = coins[key]['price']
                     if new_price != token_info.price:
@@ -518,36 +715,55 @@ class MultiTokenWhaleMonitor:
             self.stats["errors"] += 1
             return False
     
-    # ----------------- 模块 C: 实时监听 (RPC) - 优化版 -----------------
-    def get_batch_logs(self, from_block: int, to_block: int) -> List:
+    # ----------------- 模块 C: 实时监听 (RPC) - 多链优化版 -----------------
+    def get_batch_logs_for_chain(self, chain_name: str, from_block: int, to_block: int) -> List:
         """
-        批量获取所有监控 Token 的 Transfer 日志
-        单次 RPC 调用获取所有 Token 的事件
+        获取指定链上所有监控 Token 的 Transfer 日志
+        单次 RPC 调用获取该链所有 Token 的事件
         """
-        token_addresses = list(self.tokens.keys())
+        if chain_name not in self.chain_providers:
+            return []
+        
+        token_addresses = self.tokens_by_chain.get(chain_name, [])
+        if not token_addresses:
+            return []
+        
+        w3 = self.chain_providers[chain_name]
         
         try:
-            logs = self.w3.eth.get_logs({
+            logs = w3.eth.get_logs({
                 'fromBlock': from_block,
                 'toBlock': to_block,
-                'address': token_addresses,  # 批量查询多个合约
+                'address': token_addresses,  # 批量查询该链上的多个合约
                 'topics': [self.TRANSFER_TOPIC]
             })
             return logs
         except Exception as e:
-            logger.error(f"批量获取日志失败: {e}")
+            logger.error(f"[{chain_name}] 批量获取日志失败: {e}")
             self.stats["errors"] += 1
             return []
     
-    def process_logs_batch(self, logs: List):
+    def get_batch_logs(self, from_block: int, to_block: int) -> List:
         """
-        批量处理 Transfer 事件日志 (优化版)
+        兼容方法: 获取默认链 (ethereum) 的日志
+        """
+        return self.get_batch_logs_for_chain("ethereum", from_block, to_block)
+    
+    def process_logs_batch(self, logs: List, chain_name: str = "ethereum"):
+        """
+        批量处理 Transfer 事件日志 (多链优化版)
         - 预计算地址转换
         - 使用全局索引快速匹配
         - 批量处理减少锁竞争
+        
+        Args:
+            logs: 日志列表
+            chain_name: 日志来源的链名称
         """
         if not logs:
             return
+        
+        w3 = self.chain_providers.get(chain_name, self.w3)
         
         # 预处理: 按 Token 分组
         alerts_to_send = []
@@ -567,16 +783,20 @@ class MultiTokenWhaleMonitor:
                 log_address = log['address']
                 if isinstance(log_address, bytes):
                     log_address = log_address.hex()
-                token_addr = self.w3.to_checksum_address(log_address)
+                token_addr = w3.to_checksum_address(log_address)
                 
                 if token_addr not in self.tokens:
                     continue
                 
                 token_info = self.tokens[token_addr]
                 
+                # 验证链匹配
+                if token_info.chain != chain_name:
+                    continue
+                
                 # 解析地址 (优化: 直接切片，避免重复转换)
-                from_addr = self.w3.to_checksum_address("0x" + log['topics'][1].hex()[-40:])
-                to_addr = self.w3.to_checksum_address("0x" + log['topics'][2].hex()[-40:])
+                from_addr = w3.to_checksum_address("0x" + log['topics'][1].hex()[-40:])
+                to_addr = w3.to_checksum_address("0x" + log['topics'][2].hex()[-40:])
                 
                 # 识别 Mint/Burn 事件
                 is_mint = from_addr == Config.ZERO_ADDRESS
@@ -640,7 +860,7 @@ class MultiTokenWhaleMonitor:
                     self.processed_txs.add(tx_hash)
                     
             except Exception as e:
-                logger.error(f"处理 Log 异常: {e}")
+                logger.error(f"[{chain_name}] 处理 Log 异常: {e}")
                 self.stats["errors"] += 1
         
         # 批量发送警报
@@ -674,7 +894,12 @@ class MultiTokenWhaleMonitor:
     def _format_alert_message(self, token_info: TokenInfo, whale_addr: str, rank: int, 
                                action: str, amount: float, usd_value: float,
                                tx_hash: str, block_num: int, event_type: str) -> str:
-        """格式化警报消息"""
+        """格式化警报消息 (支持多链和地址标签)"""
+        # 获取链配置
+        chain_config = Config.get_chain_config(token_info.chain)
+        chain_name = chain_config.get("name", token_info.chain)
+        explorer_url = chain_config.get("explorer", "https://etherscan.io")
+        
         # 根据事件类型选择 emoji 和动作描述
         event_config = {
             "buy": {"emoji": "🟢", "action_text": "增持"},
@@ -685,6 +910,15 @@ class MultiTokenWhaleMonitor:
         config = event_config.get(event_type, {"emoji": "🚨", "action_text": "转账"})
         header_emoji = config["emoji"]
         action_text = config["action_text"]
+        
+        # 获取地址标签
+        address_label = self.get_address_label(whale_addr)
+        
+        # 格式化地址显示 (如果有标签则显示标签)
+        if address_label:
+            addr_display = f"`{address_label}`"
+        else:
+            addr_display = f"`{whale_addr[:6]}...{whale_addr[-4:]}`"
         
         # 格式化价格显示 (根据价格大小动态调整精度)
         if token_info.price >= 1:
@@ -712,19 +946,28 @@ class MultiTokenWhaleMonitor:
         else:
             value_str = f"${usd_value:,.2f}"
         
-        msg = (
-            f"{header_emoji} *{token_info.symbol} 大户{action_text}*\n"
-            f"┌───────────────────────\n"
-            f"│ 🏷️ *排名:* `#{rank}`\n"
-            f"│ 💰 *数量:* `{amount_str}` {token_info.symbol}\n"
-            f"│ 💵 *价值:* `{value_str}`\n"
-            f"│ 👛 *地址:* `{whale_addr[:6]}...{whale_addr[-4:]}`\n"
-            f"│ 📈 *价格:* `{price_str}`\n"
-            f"└───────────────────────\n"
-            f"[🔗 交易详情](https://etherscan.io/tx/{tx_hash}) · "
-            f"[📋 地址](https://etherscan.io/address/{whale_addr})"
-        )
-        return msg
+        # 构建消息 (多链版本)
+        msg_lines = [
+            f"{header_emoji} *{token_info.symbol} 大户{action_text}* `[{chain_name}]`",
+            f"┌───────────────────────",
+            f"│ 🏷️ *排名:* `#{rank}`",
+            f"│ 💰 *数量:* `{amount_str}` {token_info.symbol}",
+            f"│ 💵 *价值:* `{value_str}`",
+            f"│ 👛 *地址:* {addr_display}",
+        ]
+        
+        # 如果有标签，额外显示完整地址
+        if address_label:
+            msg_lines.append(f"│ 📍 *完整:* `{whale_addr[:8]}...{whale_addr[-6:]}`")
+        
+        msg_lines.extend([
+            f"│ 📈 *价格:* `{price_str}`",
+            f"└───────────────────────",
+            f"[🔗 交易详情]({explorer_url}/tx/{tx_hash}) · "
+            f"[📋 地址]({explorer_url}/address/{whale_addr})"
+        ])
+        
+        return "\n".join(msg_lines)
     
     def send_telegram(self, text: str, is_system: bool = False) -> bool:
         """发送 Telegram 消息"""
@@ -756,60 +999,81 @@ class MultiTokenWhaleMonitor:
         return requests.request(method, url, **kwargs)
     
     def get_status(self) -> dict:
-        """获取监控状态"""
+        """获取监控状态 (多链版本)"""
         token_status = []
         total_whales = 0
+        chains_status = {}
+        
         for addr, info in self.tokens.items():
             total_whales += len(info.whitelist)
             token_status.append({
                 "symbol": info.symbol,
+                "chain": info.chain,
                 "address": addr[:10] + "...",
                 "whitelist_size": len(info.whitelist),
                 "price": info.price,
                 "degraded": info.chainbase_degraded
             })
+            
+            # 按链统计
+            if info.chain not in chains_status:
+                chains_status[info.chain] = {"tokens": 0, "whales": 0}
+            chains_status[info.chain]["tokens"] += 1
+            chains_status[info.chain]["whales"] += len(info.whitelist)
         
         return {
             "running": self._running,
+            "chains_count": len(self.chain_providers),
             "tokens_count": len(self.tokens),
             "total_whales": total_whales,
             "global_index_size": len(self.global_whale_index),
+            "address_labels_cached": len(self.address_labels),
             "tx_cache_size": len(self.processed_txs),
             "stats": self.stats.copy(),
-            "tokens": token_status
+            "tokens": token_status,
+            "chains": chains_status
         }
     
     def print_status(self):
-        """打印状态摘要"""
+        """打印状态摘要 (多链版本)"""
         status = self.get_status()
-        token_summary = " | ".join([
-            f"{t['symbol']}:{t['whitelist_size']}" 
-            for t in status['tokens']
+        
+        # 按链分组显示
+        chain_summary = " | ".join([
+            f"{Config.get_chain_config(c)['name'][:3]}:{s['tokens']}T/{s['whales']}W" 
+            for c, s in status.get('chains', {}).items()
         ])
+        
         logger.info(
-            f"📊 状态 | Token: {status['tokens_count']} | "
+            f"📊 状态 | 链: {status['chains_count']} | "
+            f"Token: {status['tokens_count']} | "
             f"大户: {status['total_whales']} | "
-            f"索引: {status['global_index_size']} | "
+            f"标签: {status['address_labels_cached']} | "
             f"警报: {status['stats']['alerts_sent']} | "
             f"错误: {status['stats']['errors']}"
         )
-        logger.debug(f"   详情: {token_summary}")
+        if chain_summary:
+            logger.debug(f"   详情: {chain_summary}")
     
-    # ----------------- 启动逻辑 -----------------
+    # ----------------- 启动逻辑 (多链版本) -----------------
     def start(self):
-        """启动监控系统"""
-        logger.info("🚀 多 Token 监控系统启动中...")
+        """启动监控系统 (支持多链)"""
+        logger.info("🚀 多链 Token 监控系统启动中...")
         self._running = True
         
-        # 发送启动通知
-        token_list = "\n".join([
-            f"  • {info.symbol} (Top {info.top_n}, ${info.threshold_usd:,.0f})"
-            for info in self.tokens.values()
-        ])
+        # 发送启动通知 (按链分组显示)
+        token_lines = []
+        for chain_name, token_addrs in self.tokens_by_chain.items():
+            chain_config = Config.get_chain_config(chain_name)
+            token_lines.append(f"📌 *{chain_config['name']}*:")
+            for addr in token_addrs:
+                info = self.tokens[addr]
+                token_lines.append(f"  • {info.symbol} (Top {info.top_n}, ${info.threshold_usd:,.0f})")
+        
         startup_msg = (
-            f"🚀 *Multi-Token Whale Monitor Started*\n"
-            f"监控 Token 数量: `{len(self.tokens)}`\n"
-            f"{token_list}"
+            f"🚀 *Multi-Chain Whale Monitor Started*\n"
+            f"监控: `{len(self.tokens)}` Token / `{len(self.chain_providers)}` 链\n"
+            + "\n".join(token_lines)
         )
         self.send_telegram(startup_msg, is_system=True)
         
@@ -873,10 +1137,14 @@ class MultiTokenWhaleMonitor:
         if tokens_without_price:
             logger.warning(f"⚠️ 以下 Token 价格获取失败: {', '.join(tokens_without_price)}")
         
-        # 3. 主循环: 实时监听 RPC (批量获取)
-        latest_block = self.w3.eth.block_number
-        logger.info(f"📡 开始监听链上 Transfer 事件 (Block #{latest_block})...")
-        logger.info(f"   监控 {len(self.tokens)} 个 Token, 共 {total_whales} 个大户地址")
+        # 3. 主循环: 多链实时监听 RPC
+        logger.info(f"📡 开始监听 {len(self.chain_providers)} 条链的 Transfer 事件...")
+        for chain_name, block_num in self.chain_latest_blocks.items():
+            chain_config = Config.get_chain_config(chain_name)
+            token_count = len(self.tokens_by_chain.get(chain_name, []))
+            logger.info(f"   [{chain_config['name']}] Block #{block_num} | {token_count} Token")
+        
+        logger.info(f"   总计监控 {len(self.tokens)} 个 Token, 共 {total_whales} 个大户地址")
         
         consecutive_errors = 0
         last_activity_time = time.time()
@@ -890,38 +1158,62 @@ class MultiTokenWhaleMonitor:
             try:
                 poll_count += 1
                 current_time = time.time()
-                current_block = self.w3.eth.block_number
+                total_new_blocks = 0
+                total_transfers = 0
                 
-                if current_block > latest_block:
-                    blocks_diff = current_block - latest_block
-                    
-                    # 批量获取所有 Token 的日志
-                    logs = self.get_batch_logs(latest_block + 1, current_block)
-                    
-                    transfer_count = len(logs) if logs else 0
-                    if transfer_count > 0:
-                        logger.info(
-                            f"📦 Block #{latest_block + 1} → #{current_block} | "
-                            f"+{blocks_diff} 区块 | {transfer_count} 笔 Transfer"
-                        )
-                        # 批量处理日志
-                        self.process_logs_batch(logs)
-                    else:
-                        logger.debug(
-                            f"📦 Block #{current_block} | +{blocks_diff} 区块 | 无相关 Transfer"
-                        )
-                    
-                    self.stats["blocks_processed"] += blocks_diff
-                    latest_block = current_block
-                    last_activity_time = current_time
+                # 遍历所有链
+                for chain_name, w3 in self.chain_providers.items():
+                    try:
+                        latest_block = self.chain_latest_blocks[chain_name]
+                        current_block = w3.eth.block_number
+                        
+                        if current_block > latest_block:
+                            blocks_diff = current_block - latest_block
+                            total_new_blocks += blocks_diff
+                            
+                            # 获取该链的日志
+                            logs = self.get_batch_logs_for_chain(
+                                chain_name, 
+                                latest_block + 1, 
+                                current_block
+                            )
+                            
+                            transfer_count = len(logs) if logs else 0
+                            total_transfers += transfer_count
+                            
+                            if transfer_count > 0:
+                                chain_config = Config.get_chain_config(chain_name)
+                                logger.info(
+                                    f"📦 [{chain_config['name']}] Block #{latest_block + 1} → #{current_block} | "
+                                    f"+{blocks_diff} 区块 | {transfer_count} 笔 Transfer"
+                                )
+                                # 处理日志
+                                self.process_logs_batch(logs, chain_name)
+                            
+                            self.chain_latest_blocks[chain_name] = current_block
+                            last_activity_time = current_time
+                            
+                    except Exception as e:
+                        logger.error(f"[{chain_name}] 轮询异常: {e}")
+                        self.stats["errors"] += 1
+                
+                if total_new_blocks > 0:
+                    self.stats["blocks_processed"] += total_new_blocks
                     consecutive_errors = 0
                 
                 # 心跳输出
                 if current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                     time_since_activity = current_time - last_activity_time
                     total_whales = sum(len(t.whitelist) for t in self.tokens.values())
+                    
+                    # 构建各链区块信息
+                    chain_blocks = " | ".join([
+                        f"{Config.get_chain_config(c)['name'][:3]}:#{b}"
+                        for c, b in self.chain_latest_blocks.items()
+                    ])
+                    
                     logger.info(
-                        f"💓 心跳 | Block #{latest_block} | "
+                        f"💓 心跳 | {chain_blocks} | "
                         f"轮询 #{poll_count} | "
                         f"距上次新区块: {time_since_activity:.0f}s | "
                         f"监控: {len(self.tokens)} Token / {total_whales} 地址"
@@ -930,7 +1222,7 @@ class MultiTokenWhaleMonitor:
                     
                     if time_since_activity > STALE_THRESHOLD:
                         logger.warning(
-                            f"⚠️ 警告: {time_since_activity:.0f}s 未检测到新区块，"
+                            f"⚠️ 警告: {time_since_activity:.0f}s 未检测到任何链的新区块，"
                             f"RPC 可能存在问题"
                         )
                 
@@ -962,7 +1254,8 @@ class MultiTokenWhaleMonitor:
         self.print_status()
         
         stop_msg = (
-            f"🛑 *Multi-Token Whale Monitor Stopped*\n"
+            f"🛑 *Multi-Chain Whale Monitor Stopped*\n"
+            f"Chains: `{len(self.chain_providers)}`\n"
             f"Tokens: `{len(self.tokens)}`\n"
             f"Blocks: `{self.stats['blocks_processed']}`\n"
             f"Alerts: `{self.stats['alerts_sent']}`\n"

@@ -1,90 +1,30 @@
-import os
+"""
+ERC20 Whale Monitor - 大户监控主程序
+
+功能:
+- 定期从 Chainbase 获取 Top Holders 名单
+- 实时监听链上 Transfer 事件
+- 触发阈值后推送 Telegram 通知
+- 本地缓存支持，API 失败时自动回退
+"""
+
 import time
-import json
 import requests
 import threading
-import logging
 from collections import OrderedDict
-from dotenv import load_dotenv
 from web3 import Web3
 from datetime import datetime
 from functools import wraps
 
-# 加载 .env 环境变量
-load_dotenv()
+# 导入配置和缓存
+from config import Config, setup_logging
+from cache import get_cache
 
-# ================= 配置加载类 =================
-class Config:
-    """集中管理所有配置项"""
-    # RPC 配置
-    RPC_URL = os.getenv("RPC_URL", "https://rpc.ankr.com/eth")
-    RPC_TIMEOUT = int(os.getenv("RPC_TIMEOUT", 30))
-    
-    # Chainbase 配置
-    CHAINBASE_KEY = os.getenv("CHAINBASE_API_KEY")
-    
-    # 监控目标配置
-    TARGET_TOKEN = os.getenv("TARGET_TOKEN_ADDRESS", "0x6982508145454Ce325dDbE47a25d4ec3d2311933")
-    TOP_N = int(os.getenv("TOP_N_HOLDERS", 50))
-    THRESHOLD_USD = float(os.getenv("ALERT_THRESHOLD_USD", 10000))
-    
-    # 轮询配置
-    BLOCK_POLL_INTERVAL = int(os.getenv("BLOCK_POLL_INTERVAL", 12))  # 以太坊出块时间
-    WHALE_UPDATE_INTERVAL = int(os.getenv("WHALE_UPDATE_INTERVAL", 1800))  # 30分钟更新名单
-    PRICE_UPDATE_INTERVAL = int(os.getenv("PRICE_UPDATE_INTERVAL", 60))  # 60秒更新价格
-    
-    # Telegram 配置
-    TG_TOKEN = os.getenv("TG_BOT_TOKEN")
-    TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-    
-    # 重试配置
-    MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
-    BASE_RETRY_DELAY = float(os.getenv("BASE_RETRY_DELAY", 1.0))
-    
-    # 缓存配置
-    TX_CACHE_SIZE = int(os.getenv("TX_CACHE_SIZE", 10000))  # 已处理交易缓存大小
-    
-    # 忽略名单 (黑洞地址、零地址)
-    IGNORE_LIST = {
-        "0x0000000000000000000000000000000000000000",
-        "0x000000000000000000000000000000000000dEaD"
-    }
-    
-    # 零地址 (用于识别 Mint/Burn)
-    ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
-    DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD"
-
-
-# ================= 日志配置 =================
-def setup_logging():
-    """配置日志系统，支持文件和控制台输出"""
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    log_file = os.getenv("LOG_FILE", "whale_monitor.log")
-    
-    # 创建格式化器
-    formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - [%(funcName)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    
-    # 根日志器
-    logger = logging.getLogger()
-    logger.setLevel(getattr(logging, log_level))
-    
-    # 控制台处理器
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    # 文件处理器 (可选)
-    if log_file:
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    
-    return logging.getLogger(__name__)
-
+# 初始化日志
 logger = setup_logging()
+
+# 初始化缓存
+whale_cache = get_cache(Config.CACHE_DIR)
 
 
 # ================= LRU 缓存实现 =================
@@ -224,65 +164,86 @@ class WhaleMonitor:
         logger.info(f"🎯 监控目标: {self.token_meta['symbol']} ({self.target_token[:10]}...)")
         logger.info(f"   Decimals: {self.token_meta['decimals']} | 阈值: ${Config.THRESHOLD_USD:,.0f}")
 
-    # ----------------- 模块 A: 巨鲸发现 (Chainbase) -----------------
+    # ----------------- 模块 A: 巨鲸发现 (Chainbase / Ethplorer / Cache) -----------------
     def update_whales_via_chainbase(self):
-        """通过 Chainbase SQL API 获取持仓排名"""
-        if not Config.CHAINBASE_KEY:
-            logger.warning("⚠️ 未配置 Chainbase Key，使用内置模拟大户名单进行演示...")
-            self._load_mock_whales()
+        """
+        获取 Top Holders 名单
+        优先级: Chainbase → Ethplorer → 本地缓存 → 模拟名单
+        """
+        # 尝试从 Chainbase 获取
+        if Config.CHAINBASE_KEY and not self._chainbase_degraded:
+            result = self._fetch_from_chainbase()
+            if result:
+                return True
+        elif not Config.CHAINBASE_KEY:
+            logger.warning("⚠️ 未配置 Chainbase Key，尝试其他数据源...")
+        
+        # 尝试从 Ethplorer 获取
+        result = self._fetch_from_ethplorer()
+        if result:
             return True
         
-        if self._chainbase_degraded:
-            logger.warning("⚠️ Chainbase 处于降级模式，跳过更新，继续使用旧名单")
-            return False
+        # 尝试从本地缓存加载
+        result = self._load_from_cache()
+        if result:
+            return True
         
+        # 最后使用模拟名单
+        logger.warning("⚠️ 所有数据源均失败，使用模拟名单...")
+        self._load_mock_whales()
+        return True
+    
+    def _fetch_from_chainbase(self) -> bool:
+        """从 Chainbase 获取数据"""
         logger.info("🔄 正在从 Chainbase 更新 Top Holders 名单...")
         
-        query = f"""
-        SELECT address, original_amount 
-        FROM ethereum.token_holders 
-        WHERE token_address = '{Config.TARGET_TOKEN.lower()}' 
-        ORDER BY original_amount DESC 
-        LIMIT {Config.TOP_N + 10}
-        """
-        
-        url = "https://api.chainbase.online/v1/dw/query"
-        headers = {"x-api-key": Config.CHAINBASE_KEY, "Content-Type": "application/json"}
+        url = f"https://api.chainbase.online/v1/token/top-holders"
+        headers = {"x-api-key": Config.CHAINBASE_KEY}
+        params = {
+            "chain_id": 1,  # Ethereum Mainnet
+            "contract_address": Config.TARGET_TOKEN.lower(),
+            "page": 1,
+            "limit": Config.TOP_N + 10
+        }
         
         try:
             resp = self._request_with_retry(
-                "POST", url, headers=headers, json={"query": query}, timeout=30
+                "GET", url, headers=headers, params=params, timeout=Config.HTTP_TIMEOUT
             )
             
             if resp.status_code == 429:
-                # 额度耗尽，进入降级模式
-                self._enter_degraded_mode("API 额度耗尽 (429)")
+                self._enter_degraded_mode("Chainbase API 额度耗尽 (429)")
                 return False
             
             if resp.status_code != 200:
-                raise Exception(f"API Error: {resp.status_code} - {resp.text[:200]}")
+                logger.warning(f"Chainbase API 错误: {resp.status_code} - {resp.text[:200]}")
+                return False
             
-            data = resp.json().get('data', {}).get('result', [])
+            result = resp.json()
+            data = result.get('data', [])
+            
             if not data:
-                logger.warning("Chainbase 返回空数据，保留现有名单")
+                logger.warning("Chainbase 返回空数据")
                 return False
             
             new_list = []
             rank = 1
             for row in data:
-                addr = self.w3.to_checksum_address(row['address'])
+                addr = self.w3.to_checksum_address(row.get('wallet_address', row.get('address', '')))
                 if addr in Config.IGNORE_LIST:
                     continue
                 if rank > Config.TOP_N:
                     break
-                balance = float(row.get('original_amount', 0))
+                balance = float(row.get('original_amount', row.get('amount', 0)))
                 new_list.append((addr, rank, balance))
                 rank += 1
             
-            self._update_local_list(new_list)
-            self._last_whale_update = time.time()
-            logger.info(f"✅ 名单更新完成 | 监控 {len(self.whitelist)} 个地址")
-            return True
+            if new_list:
+                self._update_local_list(new_list, source="chainbase")
+                logger.info(f"✅ Chainbase 名单更新完成 | 监控 {len(self.whitelist)} 个地址")
+                return True
+            
+            return False
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Chainbase 网络错误: {e}")
@@ -293,16 +254,106 @@ class WhaleMonitor:
             self.stats["errors"] += 1
             return False
     
+    def _fetch_from_ethplorer(self) -> bool:
+        """从 Ethplorer 获取数据"""
+        logger.info("🔄 正在从 Ethplorer 更新 Top Holders 名单...")
+        
+        url = f"https://api.ethplorer.io/getTopTokenHolders/{Config.TARGET_TOKEN}"
+        params = {
+            "apiKey": "freekey",
+            "limit": min(Config.TOP_N + 10, 100)
+        }
+        
+        try:
+            resp = requests.get(url, params=params, timeout=Config.HTTP_TIMEOUT)
+            
+            if resp.status_code == 429:
+                logger.warning("Ethplorer API 被限流")
+                return False
+            
+            if resp.status_code != 200:
+                logger.warning(f"Ethplorer API 错误: {resp.status_code}")
+                return False
+            
+            data = resp.json()
+            holders = data.get('holders', [])
+            
+            if not holders:
+                logger.warning("Ethplorer 返回空数据")
+                return False
+            
+            new_list = []
+            rank = 1
+            for holder in holders:
+                addr = self.w3.to_checksum_address(holder.get('address', ''))
+                if addr in Config.IGNORE_LIST:
+                    continue
+                if rank > Config.TOP_N:
+                    break
+                balance = float(holder.get('balance', 0))
+                new_list.append((addr, rank, balance))
+                rank += 1
+            
+            if new_list:
+                self._update_local_list(new_list, source="ethplorer")
+                logger.info(f"✅ Ethplorer 名单更新完成 | 监控 {len(self.whitelist)} 个地址")
+                return True
+            
+            return False
+                
+        except Exception as e:
+            logger.error(f"Ethplorer 更新失败: {e}")
+            self.stats["errors"] += 1
+            return False
+    
+    def _load_from_cache(self) -> bool:
+        """从本地缓存加载数据"""
+        logger.info("🔄 正在从本地缓存加载 Top Holders 名单...")
+        
+        # 获取缓存信息
+        cache_info = whale_cache.get_cache_info(Config.TARGET_TOKEN)
+        if not cache_info:
+            logger.warning("本地缓存不存在")
+            return False
+        
+        # 加载缓存数据 (不检查过期，作为最后备份)
+        holders = whale_cache.load_holders(Config.TARGET_TOKEN)
+        if not holders:
+            logger.warning("本地缓存加载失败")
+            return False
+        
+        # 更新内存
+        self._update_local_list(holders, source="cache", save_cache=False)
+        
+        # 计算缓存年龄
+        cache_age = time.time() - cache_info.get('updated_at', 0)
+        cache_age_str = self._format_duration(cache_age)
+        
+        logger.info(
+            f"✅ 从本地缓存加载完成 | 监控 {len(self.whitelist)} 个地址 | "
+            f"缓存来源: {cache_info.get('source')} | 缓存年龄: {cache_age_str}"
+        )
+        return True
+    
     def _load_mock_whales(self):
         """加载模拟大户名单 (用于演示/测试)"""
-        mock_whales = [
-            ("0xF977814e90dA44bFA03b6295A0616a897441aceC", 1, 0),  # Binance Hot Wallet
-            ("0x5a52E96BAcdaBb82fd05763E25335261B270Efcb", 2, 0),
-        ]
-        self._update_local_list(mock_whales)
+        self._update_local_list(Config.MOCK_WHALES, source="mock", save_cache=False)
+        logger.info(f"✅ 已加载模拟名单 | 监控 {len(self.whitelist)} 个地址")
     
-    def _update_local_list(self, address_rank_balance_tuples):
-        """更新内存中的白名单"""
+    def _update_local_list(
+        self, 
+        address_rank_balance_tuples, 
+        source: str = "unknown",
+        save_cache: bool = True
+    ):
+        """
+        更新内存中的白名单
+        
+        Args:
+            address_rank_balance_tuples: [(address, rank, balance), ...]
+            source: 数据来源
+            save_cache: 是否保存到本地缓存
+        """
         temp_whitelist = set()
         temp_details = {}
         for item in address_rank_balance_tuples:
@@ -314,20 +365,43 @@ class WhaleMonitor:
         # 原子更新
         self.whitelist = temp_whitelist
         self.whale_details = temp_details
+        self._last_whale_update = time.time()
+        
+        # 保存到本地缓存 (仅当数据来自 API 时)
+        if save_cache and source in ("chainbase", "ethplorer"):
+            whale_cache.save(
+                token_address=Config.TARGET_TOKEN,
+                holders=list(address_rank_balance_tuples),
+                symbol=self.token_meta.get('symbol', 'UNKNOWN'),
+                source=source
+            )
+            logger.debug(f"💾 已保存到本地缓存 (来源: {source})")
     
     def _enter_degraded_mode(self, reason: str):
         """进入降级模式"""
         self._chainbase_degraded = True
-        msg = f"⚠️ 系统降级警告\n原因: {reason}\n当前名单将继续使用，但不再更新"
+        msg = f"⚠️ 系统降级警告\n原因: {reason}\n将尝试其他数据源"
         logger.warning(msg)
         self.send_telegram(msg, is_system=True)
+    
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """格式化时长"""
+        if seconds < 60:
+            return f"{seconds:.0f}秒"
+        elif seconds < 3600:
+            return f"{seconds/60:.0f}分钟"
+        elif seconds < 86400:
+            return f"{seconds/3600:.1f}小时"
+        else:
+            return f"{seconds/86400:.1f}天"
     
     # ----------------- 模块 B: 价格获取 (DeFiLlama) -----------------
     def update_price(self):
         """从 DeFiLlama 获取 Token 价格 (免费且无需 Key)"""
         url = f"https://coins.llama.fi/prices/current/ethereum:{Config.TARGET_TOKEN}"
         try:
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, timeout=Config.HTTP_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
             key = f"ethereum:{Config.TARGET_TOKEN}"
@@ -472,7 +546,7 @@ class WhaleMonitor:
         }
         
         try:
-            resp = requests.post(url, json=payload, timeout=10)
+            resp = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
             if resp.status_code != 200:
                 logger.warning(f"Telegram 发送失败: {resp.text[:100]}")
                 return False
@@ -550,7 +624,7 @@ class WhaleMonitor:
         # 2. 启动状态打印线程
         def status_printer():
             while self._running:
-                time.sleep(300)  # 每 5 分钟打印一次状态
+                time.sleep(Config.STATUS_PRINT_INTERVAL)
                 if self._running:
                     self.print_status()
         
@@ -580,7 +654,6 @@ class WhaleMonitor:
         logger.info(f"📡 开始监听链上 Transfer 事件 (Block #{latest_block})...")
         
         consecutive_errors = 0
-        max_consecutive_errors = 10
         
         while self._running:
             try:
@@ -612,15 +685,15 @@ class WhaleMonitor:
                 consecutive_errors += 1
                 self.stats["errors"] += 1
                 
-                if consecutive_errors >= max_consecutive_errors:
-                    error_msg = f"❌ 连续错误达到 {max_consecutive_errors} 次，系统暂停"
+                if consecutive_errors >= Config.MAX_CONSECUTIVE_ERRORS:
+                    error_msg = f"❌ 连续错误达到 {Config.MAX_CONSECUTIVE_ERRORS} 次，系统暂停"
                     logger.error(error_msg)
                     self.send_telegram(error_msg, is_system=True)
                     time.sleep(60)  # 暂停 1 分钟
                     consecutive_errors = 0
                 else:
                     delay = min(5 * consecutive_errors, 30)
-                    logger.error(f"主循环异常 ({consecutive_errors}/{max_consecutive_errors}): {e}, {delay}s 后重试")
+                    logger.error(f"主循环异常 ({consecutive_errors}/{Config.MAX_CONSECUTIVE_ERRORS}): {e}, {delay}s 后重试")
                     time.sleep(delay)
     
     def stop(self):
@@ -641,6 +714,10 @@ class WhaleMonitor:
 
 # ================= 入口点 =================
 if __name__ == "__main__":
+    # 打印配置信息
+    Config.print_config()
+    Config.validate()
+    
     try:
         monitor = WhaleMonitor()
         monitor.start()

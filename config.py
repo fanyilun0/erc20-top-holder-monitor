@@ -43,21 +43,26 @@ class Config:
     # 监控目标配置 (可在此处直接修改)
     # ============================================================
     
-    # 要监控的 ERC20 Token 合约地址
-    TARGET_TOKEN = "0x6982508145454Ce325dDbE47a25d4ec3d2311933"  # PEPE
+    # 要监控的 ERC20 Token 合约地址列表 (支持多 Token 批量监控)
+    # 格式: {地址: {"top_n": N, "threshold_usd": X}} 或简写为 {地址: None} 使用默认值
+    TARGET_TOKENS = {
+        "0x6982508145454Ce325dDbE47a25d4ec3d2311933": None,  # PEPE - 使用默认配置
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7": {"top_n": 30, "threshold_usd": 50000},  # USDT
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48": {"top_n": 30, "threshold_usd": 50000},  # USDC
+    }
     
-    # 监控前 N 名持仓大户
-    TOP_N = 50
+    # 默认监控前 N 名持仓大户
+    DEFAULT_TOP_N = 50
     
-    # 警报阈值 (USD)，低于此金额的交易将被忽略
-    THRESHOLD_USD = 10000.0
+    # 默认警报阈值 (USD)，低于此金额的交易将被忽略
+    DEFAULT_THRESHOLD_USD = 10000.0
     
     # ============================================================
     # 轮询间隔配置 (秒)
     # ============================================================
     
-    # 区块轮询间隔 (以太坊约 12 秒出块)
-    BLOCK_POLL_INTERVAL = 12
+    # 区块轮询间隔 (以太坊约 12 秒出块，设置更短以提高响应速度)
+    BLOCK_POLL_INTERVAL = 3
     
     # 大户名单更新间隔 (默认 30 分钟)
     WHALE_UPDATE_INTERVAL = 1800
@@ -99,8 +104,8 @@ class Config:
     CACHE_DIR = "cache"
     
     # 缓存最大有效期 (秒)，超过此时间优先从 API 获取
-    # 设为 None 表示缓存永不过期 (仅作为备份使用)
-    CACHE_MAX_AGE = None
+    # 默认 30 分钟 (1800 秒)
+    CACHE_MAX_AGE = 1800
     
     # ============================================================
     # 日志配置
@@ -136,15 +141,6 @@ class Config:
     DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD"
     
     # ============================================================
-    # 模拟数据 (用于演示/测试，无 Chainbase Key 时使用)
-    # ============================================================
-    
-    MOCK_WHALES = [
-        ("0xF977814e90dA44bFA03b6295A0616a897441aceC", 1, 0),  # Binance Hot Wallet
-        ("0x5a52E96BAcdaBb82fd05763E25335261B270Efcb", 2, 0),
-    ]
-    
-    # ============================================================
     # 类方法
     # ============================================================
     
@@ -173,14 +169,37 @@ class Config:
         return True
     
     @classmethod
+    def get_target_tokens(cls) -> dict:
+        """
+        获取要监控的 Token 列表
+        
+        Returns:
+            dict: {address: {"top_n": N, "threshold_usd": X}, ...}
+        """
+        tokens = {}
+        
+        for addr, config in cls.TARGET_TOKENS.items():
+            if config is None:
+                config = {}
+            tokens[addr] = {
+                "top_n": config.get("top_n", cls.DEFAULT_TOP_N),
+                "threshold_usd": config.get("threshold_usd", cls.DEFAULT_THRESHOLD_USD)
+            }
+        
+        return tokens
+    
+    @classmethod
     def print_config(cls):
         """打印当前配置 (隐藏敏感信息)"""
         print("=" * 50)
         print("当前配置:")
         print("=" * 50)
-        print(f"  TARGET_TOKEN: {cls.TARGET_TOKEN}")
-        print(f"  TOP_N: {cls.TOP_N}")
-        print(f"  THRESHOLD_USD: ${cls.THRESHOLD_USD:,.0f}")
+        
+        tokens = cls.get_target_tokens()
+        print(f"  监控 Token 数量: {len(tokens)}")
+        for i, (addr, cfg) in enumerate(tokens.items(), 1):
+            print(f"    [{i}] {addr[:10]}... | Top {cfg['top_n']} | 阈值 ${cfg['threshold_usd']:,.0f}")
+        
         print(f"  BLOCK_POLL_INTERVAL: {cls.BLOCK_POLL_INTERVAL}s")
         print(f"  WHALE_UPDATE_INTERVAL: {cls.WHALE_UPDATE_INTERVAL}s")
         print(f"  RPC_URL: {cls._mask_url(cls.RPC_URL)}")

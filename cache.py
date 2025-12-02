@@ -55,7 +55,8 @@ class WhaleCache:
         token_address: str, 
         holders: List[Tuple[str, int, float]], 
         symbol: str = "UNKNOWN",
-        source: str = "unknown"
+        source: str = "unknown",
+        decimals: int = 18
     ) -> bool:
         """
         保存大户名单到本地缓存
@@ -65,6 +66,7 @@ class WhaleCache:
             holders: 大户列表 [(address, rank, balance), ...]
             symbol: Token 符号
             source: 数据来源 (chainbase/ethplorer/mock)
+            decimals: Token 精度，用于计算可读余额
         
         Returns:
             bool: 保存是否成功
@@ -74,6 +76,7 @@ class WhaleCache:
         cache_data = {
             "token_address": token_address.lower(),
             "symbol": symbol,
+            "decimals": decimals,
             "updated_at": time.time(),
             "updated_at_str": datetime.now().isoformat(),
             "source": source,
@@ -82,7 +85,8 @@ class WhaleCache:
                 {
                     "address": addr,
                     "rank": rank,
-                    "balance": balance
+                    "balance": balance,
+                    "readableBalance": balance / (10 ** decimals)
                 }
                 for addr, rank, balance in holders
             ]
